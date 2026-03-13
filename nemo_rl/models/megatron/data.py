@@ -169,13 +169,16 @@ def get_microbatch_iterator(
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
         )
+        individual_pad_factor = cfg["make_sequence_length_divisible_by"]
+        if individual_pad_factor > 1:
+            pack_seq_dim_size = _max_padded_seq_len(data, individual_pad_factor)
         (
             pad_factor,
             pad_packed_seq_to_multiple_of,
             pad_full_seq_to,
         ) = _get_pack_sequence_parameters_for_megatron(
             cfg["megatron_cfg"],
-            cfg["make_sequence_length_divisible_by"],
+            individual_pad_factor,
             pack_seq_dim_size,
         )
         micro_batch_size = 1
@@ -526,6 +529,35 @@ def _pack_sequences_for_megatron(
         cu_seqlens,
         cu_seqlens_padded,
     )
+
+
+def _max_padded_seq_len(
+    data: BatchedDataDict,
+    pad_factor: int,
+) -> int:
+    """Compute the max packed sequence length after individually padding each sequence.
+
+    `micro_batch_lengths` stores the sum of raw (or 64-byte-rounded) sequence
+    lengths, but during actual packing each sequence is padded to
+    ``pad_factor`` (= ``make_sequence_length_divisible_by``).  The sum of those
+    padded lengths can exceed the raw sum, causing the packed tensor to be
+    longer than ``pad_packed_seq_to`` and violating the TP divisibility
+    constraint in the embedding layer.
+
+    This function recomputes the max total length using the real per-sequence
+    padding that ``_pack_sequences_for_megatron`` will apply.
+    """
+    input_lengths = data["input_lengths"]
+    max_len = 0
+    for _, (start_idx, end_idx) in zip(
+        data.micro_batch_lengths[0], data.micro_batch_indices[0]
+    ):
+        total = sum(
+            _round_up_to_multiple(int(input_lengths[i]), pad_factor)
+            for i in range(start_idx, end_idx)
+        )
+        max_len = max(max_len, total)
+    return max_len
 
 
 def _get_pack_sequence_parameters_for_megatron(
