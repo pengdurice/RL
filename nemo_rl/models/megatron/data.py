@@ -169,16 +169,17 @@ def get_microbatch_iterator(
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
         )
-        individual_pad_factor = cfg["make_sequence_length_divisible_by"]
-        if individual_pad_factor > 1:
-            pack_seq_dim_size = _max_padded_seq_len(data, individual_pad_factor)
+        if cfg["make_sequence_length_divisible_by"] > 1:
+            pack_seq_dim_size = _max_padded_seq_len(
+                data, cfg["make_sequence_length_divisible_by"]
+            )
         (
             pad_factor,
             pad_packed_seq_to_multiple_of,
             pad_full_seq_to,
         ) = _get_pack_sequence_parameters_for_megatron(
             cfg["megatron_cfg"],
-            individual_pad_factor,
+            cfg["make_sequence_length_divisible_by"],
             pack_seq_dim_size,
         )
         micro_batch_size = 1
