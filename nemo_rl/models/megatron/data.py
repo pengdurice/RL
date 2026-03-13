@@ -169,10 +169,10 @@ def get_microbatch_iterator(
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
         )
-        if cfg["make_sequence_length_divisible_by"] > 1:
-            pack_seq_dim_size = _max_padded_seq_len(
-                data, cfg["make_sequence_length_divisible_by"]
-            )
+        # if cfg["make_sequence_length_divisible_by"] > 1:
+        #     pack_seq_dim_size = _max_padded_seq_len(
+        #         data, cfg["make_sequence_length_divisible_by"]
+        #     )
         (
             pad_factor,
             pad_packed_seq_to_multiple_of,
