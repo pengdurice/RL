@@ -14,7 +14,7 @@
 
 import threading as _threading
 import time
-from typing import Any, Optional
+from typing import Any
 
 import ray
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -64,114 +64,23 @@ class AsyncTrajectoryCollector:
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
 
-        # Track when generation limits cause collection to pause
-        self._last_limit_warning_version = None
-
-        # Event to signal when generation limits are cleared (more efficient than polling)
-        self._generation_limit_cleared = _threading.Event()
-        self._generation_limit_cleared.set()  # Start in cleared state
-
         # Track threads
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
-        # This value limits the parallelism of the generation requests.
+        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps.
+        # With the target-version reservation removed, this semaphore (plus the
+        # replay buffer's max_size backpressure) is what bounds how far the
+        # producer can run ahead of the trainer (AReaL-style staleness bound).
         max_inflight = (
             int(self.master_config.grpo["num_prompts_per_step"])
             * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
         ) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
-        # Simple lock to prevent race conditions when checking/spawning workers
-        self._generation_check_lock: _threading.Lock = _threading.Lock()
-        # Track which target weights are currently being generated (globally)
-        self._generating_targets: set[int] = set()
-
-    def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
-        """Calculate target weight versions for given generation weight version.
-
-        The list of versions returned enumerate the possible version a generation
-        server can target. These versions are looped over to see what training
-        step they can target. If all target versions are exhausted, this generation
-        server will remain idle until the next weight update.
-
-        Example:
-        generation_weight_version = 10
-        max_trajectory_age_steps = 4
-
-        Returns:
-            [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
-        """
-        # Read async config strictly from grpo.async_grpo
-        async_cfg = self.master_config.grpo.get("async_grpo", {})
-        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-        if generation_weight_version == self.initial_weight_version:
-            return [
-                i
-                for i in range(
-                    self.initial_weight_version,
-                    self.initial_weight_version + max_trajectory_age + 1,
-                )
-            ]
-
-        return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
-
-    def _get_next_target_for_generation(
-        self, generation_weight_version: int
-    ) -> Optional[int]:
-        """Get the next target weight that needs generation (if any)."""
-        target_weights = self._calculate_target_weights(generation_weight_version)
-        last_target_weight_already_generated = ray.get(
-            self.replay_buffer.get_last_target_weight_already_generated.remote()
-        )
-
-        with self._generation_check_lock:
-            for target_weight in target_weights:
-                if (
-                    target_weight > last_target_weight_already_generated
-                    and target_weight not in self._generating_targets
-                ):
-                    self._generating_targets.add(target_weight)
-                    print(f"🎯 Reserved target weight {target_weight} for generation")
-                    return target_weight
-
-        return None
-
     def set_weight_version(self, version: int) -> None:
         self.current_weight_version = version
-
-        # Resume collection if it was paused due to generation limits
-        was_paused = not self._generation_limit_cleared.is_set()
-        if was_paused:
-            self._generation_limit_cleared.set()  # Signal that collection can resume
-            print(f"🔄 Updated weight version to {version}, resuming collection")
-        else:
-            print(f"🔄 Updated weight version to {version}")
-
-    def _should_pause_for_generation_limits(self) -> bool:
-        """Check if collection should be paused due to generation limits."""
-        try:
-            target_weights = self._calculate_target_weights(self.current_weight_version)
-            last_target_weight_already_generated = ray.get(
-                self.replay_buffer.get_last_target_weight_already_generated.remote()
-            )
-
-            # Check if any target weight in our range needs generation
-            with self._generation_check_lock:
-                for target_weight in target_weights:
-                    if (
-                        target_weight > last_target_weight_already_generated
-                        and target_weight not in self._generating_targets
-                    ):
-                        return False  # Found a target that needs generation
-
-            print(
-                f"⏸️ All target weights {target_weights} already generated or in progress, pausing"
-            )
-            return True
-        except Exception:
-            return False
+        print(f"🔄 Updated weight version to {version}")
 
     def start_collection(self, dataloader: StatefulDataLoader) -> None:
         """Start collecting trajectories from dataloader."""
@@ -203,32 +112,6 @@ class AsyncTrajectoryCollector:
                     self._refit_pause_cleared.wait()
                     print("▶️ Refit completed, resuming collection")
 
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.grpo.get("async_grpo", {})
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
-
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
-
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
-
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
-
-                    # Double-check we're still running after being woken up
-                    if not self.running:
-                        break
-
                 if not self.running:
                     break
 
@@ -244,28 +127,23 @@ class AsyncTrajectoryCollector:
             print("🛑 Trajectory collection stopped")
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
-        """Process a single batch and generate for one target weight."""
+        """Process a single batch, generating one trajectory per prompt.
+
+        Trajectories are stamped only with the weight version that generated
+        them. There is no target-step reservation: the trainer FIFO-consumes
+        whatever is within its staleness window, so the producer just keeps
+        generating at the latest weights (bounded by the in-flight semaphore and
+        the replay buffer capacity).
+        """
         try:
             generation_weight_version = self.current_weight_version
             num_generations = self.master_config.grpo["num_generations_per_prompt"]
             num_prompts = batch.size
 
-            # Get the next target weight that needs generation
-            target_weight = self._get_next_target_for_generation(
-                generation_weight_version
-            )
-
-            if target_weight is None:
-                print(
-                    f"🔄 No targets need generation for weight {generation_weight_version}"
-                )
-                return
-
             print(
-                f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
+                f"🎯 Generating {num_prompts} prompt groups at weight version {generation_weight_version}"
             )
 
-            # Generate for all prompts in this batch for the target weight
             for prompt_idx in range(num_prompts):
                 # Wait for refit to complete if in progress
                 if not self._refit_pause_cleared.is_set() and self.running:
@@ -291,7 +169,6 @@ class AsyncTrajectoryCollector:
                     args=(
                         repeated_batch,
                         generation_weight_version,
-                        target_weight,
                         prompt_idx,
                     ),
                     daemon=True,
@@ -427,7 +304,6 @@ class AsyncTrajectoryCollector:
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
         generation_weight_version: int,
-        target_weight_version: int,
         prompt_idx: int,
     ) -> None:
         try:
@@ -473,7 +349,9 @@ class AsyncTrajectoryCollector:
                 "timestamp": time.time(),
             }
 
-            # Use exponential backoff when buffer is full
+            # Use exponential backoff when buffer is full. A full buffer is the
+            # backpressure signal that the producer is running too far ahead of
+            # the trainer (staleness bound), so we wait rather than drop.
             try:
                 backoff_delay = 0.01
                 while self.running:
@@ -481,24 +359,12 @@ class AsyncTrajectoryCollector:
                         self.replay_buffer.add.remote(
                             trajectory_group,
                             generation_weight_version,
-                            target_weight_version,
                         )
                     )
                     if status == "success":
                         print(
-                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
+                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, gen_weight {generation_weight_version})"
                         )
-
-                        # Release reservation when FIRST prompt group for this target is successfully buffered
-                        if prompt_idx == 0:
-                            with self._generation_check_lock:
-                                if target_weight_version in self._generating_targets:
-                                    self._generating_targets.discard(
-                                        target_weight_version
-                                    )
-                                    print(
-                                        f"🧹 Released reservation for target weight {target_weight_version} (first prompt buffered)"
-                                    )
                         break
                     elif status == "full":
                         # Exponential backoff up to 0.5 second
@@ -518,14 +384,6 @@ class AsyncTrajectoryCollector:
 
             traceback.print_exc()
         finally:
-            # Clean up reservation in case of error (if not already cleaned up)
-            with self._generation_check_lock:
-                if target_weight_version in self._generating_targets:
-                    self._generating_targets.discard(target_weight_version)
-                    print(
-                        f"🧹 Emergency cleanup: Released reservation for target weight {target_weight_version}"
-                    )
-
             # Detach thread record when finished
             with self._threads_lock:
                 current = _threading.current_thread()

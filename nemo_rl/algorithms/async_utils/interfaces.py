@@ -22,14 +22,12 @@ class ReplayBufferProtocol(Protocol):
         self,
         trajectory: dict[str, Any],
         weight_version: int,
-        target_weight_version: int,
     ) -> str:
-        """Add a per-prompt trajectory group with metadata.
+        """Add a per-prompt trajectory group.
 
         Args:
             trajectory: data dict
             weight_version: version of the model weights used for generation
-            target_weight_version: version of the model weights this trajectory is intended for training
         """
         ...
 
@@ -39,12 +37,12 @@ class ReplayBufferProtocol(Protocol):
         current_weight_version: int,
         max_age_steps: int,
     ) -> Optional[dict[str, Any]]:
-        """Sample per-prompt trajectory groups intended for the current training step.
+        """Sample per-prompt trajectory groups from within the staleness window.
 
-        Only returns trajectories with target_weight_version == current_weight_version.
-        If insufficient trajectories are available, returns None to stall training
-        until the remaining trajectories are generated. This ensures no trajectory
-        loses its last chance to be used for its intended training step.
+        Trajectories older than ``current_weight_version - max_age_steps`` are
+        evicted, then ``num_prompt_groups`` groups are returned FIFO. If too few
+        valid trajectories remain, returns None so the trainer waits for
+        generation to catch up.
 
         Returns:
             Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data

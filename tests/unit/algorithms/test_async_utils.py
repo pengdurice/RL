@@ -107,7 +107,6 @@ class TestReplayBuffer:
         assert debug_info["total_trajectories"] == 0
         assert debug_info["max_size"] == 10
         assert debug_info["trajectory_versions"] == []
-        assert debug_info["target_weight_versions"] == []
 
         ray.kill(buffer)
 
@@ -120,14 +119,10 @@ class TestReplayBuffer:
         trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
 
         # Push trajectories
-        status1 = ray.get(
-            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
-        )
+        status1 = ray.get(buffer.add.remote(trajectory1, weight_version=0))
         assert status1 == "success"
 
-        status2 = ray.get(
-            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
-        )
+        status2 = ray.get(buffer.add.remote(trajectory2, weight_version=1))
         assert status2 == "success"
 
         # Check size
@@ -138,7 +133,6 @@ class TestReplayBuffer:
         debug_info = ray.get(buffer.get_debug_info.remote())
         assert debug_info["total_trajectories"] == 2
         assert debug_info["trajectory_versions"] == [0, 1]
-        assert debug_info["target_weight_versions"] == [1, 2]
 
         ray.kill(buffer)
 
@@ -152,19 +146,13 @@ class TestReplayBuffer:
         trajectory3 = {"batch": {"data": "test3"}, "rollout_metrics": {"reward": 3.0}}
 
         # Push first two trajectories
-        status1 = ray.get(
-            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
-        )
-        status2 = ray.get(
-            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
-        )
+        status1 = ray.get(buffer.add.remote(trajectory1, weight_version=0))
+        status2 = ray.get(buffer.add.remote(trajectory2, weight_version=1))
         assert status1 == "success"
         assert status2 == "success"
 
         # Try to push third trajectory (should return "full")
-        status3 = ray.get(
-            buffer.add.remote(trajectory3, weight_version=2, target_weight_version=3)
-        )
+        status3 = ray.get(buffer.add.remote(trajectory3, weight_version=2))
         assert status3 == "full"
 
         # Size should still be 2
@@ -174,7 +162,7 @@ class TestReplayBuffer:
         ray.kill(buffer)
 
     def test_replay_buffer_sampling_basic(self):
-        """Test basic trajectory sampling."""
+        """Test basic trajectory sampling (FIFO within the staleness window)."""
         buffer = ReplayBuffer.remote(max_size=10)
 
         # Push trajectories with different weight versions
@@ -185,13 +173,9 @@ class TestReplayBuffer:
                 "rollout_metrics": {"reward": float(i)},
             }
             trajectories.append(trajectory)
-            ray.get(
-                buffer.add.remote(
-                    trajectory, weight_version=i, target_weight_version=i + 1
-                )
-            )
+            ray.get(buffer.add.remote(trajectory, weight_version=i))
 
-        # Sample trajectories intended for current step 2
+        # Sample at current step 2 with a window wide enough to keep all rows.
         sample_result = ray.get(
             buffer.sample.remote(
                 num_prompt_groups=1,
@@ -204,10 +188,9 @@ class TestReplayBuffer:
         assert len(sample_result["trajectories"]) == 1
         assert "avg_trajectory_age" in sample_result
 
-        # The trajectory should be intended for step 2 (target_weight_version=2)
-        # But we pushed with target_weight_version=i+1, so trajectory at i=1 has target=2
+        # FIFO returns the oldest in-window trajectory first (test0, gen v=0).
         sampled_trajectory = sample_result["trajectories"][0]
-        assert sampled_trajectory["batch"]["data"] == "test1"
+        assert sampled_trajectory["batch"]["data"] == "test0"
 
         ray.kill(buffer)
 
@@ -217,9 +200,7 @@ class TestReplayBuffer:
 
         # Push only one trajectory
         trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
-        ray.get(
-            buffer.add.remote(trajectory, weight_version=0, target_weight_version=1)
-        )
+        ray.get(buffer.add.remote(trajectory, weight_version=0))
 
         # Try to sample more trajectories than available for current step
         sample_result = ray.get(
@@ -235,7 +216,7 @@ class TestReplayBuffer:
         ray.kill(buffer)
 
     def test_replay_buffer_age_filtering(self):
-        """Test that old trajectories are filtered out."""
+        """Test that out-of-window (stale) trajectories are evicted, not errored."""
         buffer = ReplayBuffer.remote(max_size=10)
 
         # Push trajectories with different ages
@@ -245,52 +226,45 @@ class TestReplayBuffer:
             "rollout_metrics": {"reward": 2.0},
         }
 
-        ray.get(
-            buffer.add.remote(old_trajectory, weight_version=0, target_weight_version=1)
-        )
-        ray.get(
-            buffer.add.remote(
-                recent_trajectory, weight_version=2, target_weight_version=3
+        ray.get(buffer.add.remote(old_trajectory, weight_version=0))
+        ray.get(buffer.add.remote(recent_trajectory, weight_version=2))
+
+        # Sample with current_weight_version=3 and max_age_steps=1.
+        # The window is [2, 3], so the weight_version=0 row is evicted and only
+        # the recent (weight_version=2) row remains and is returned.
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=3,
+                max_age_steps=1,
             )
         )
 
-        # Sample with current_weight_version=3 and max_age_steps=1
-        # This should filter out the trajectory with weight_version=0 (too old)
-        with pytest.raises(
-            ValueError, match="Found .* trajectories older than min_valid_version"
-        ):
-            ray.get(
-                buffer.sample.remote(
-                    num_prompt_groups=1,
-                    current_weight_version=3,
-                    max_age_steps=1,
-                )
-            )
+        assert sample_result is not None
+        assert len(sample_result["trajectories"]) == 1
+        assert sample_result["trajectories"][0]["batch"]["data"] == "recent"
+        # Both the consumed row and the evicted stale row are gone.
+        assert ray.get(buffer.size.remote()) == 0
 
         ray.kill(buffer)
 
-    def test_replay_buffer_target_weight_matching(self):
-        """Test that sampling only returns trajectories intended for current step."""
+    def test_replay_buffer_fifo_ordering(self):
+        """Test that sampling consumes valid trajectories first-in-first-out."""
         buffer = ReplayBuffer.remote(max_size=10)
 
-        # Push trajectories intended for different target steps
         trajectory1 = {
-            "batch": {"data": "for_step_1"},
+            "batch": {"data": "first_in"},
             "rollout_metrics": {"reward": 1.0},
         }
         trajectory2 = {
-            "batch": {"data": "for_step_2"},
+            "batch": {"data": "second_in"},
             "rollout_metrics": {"reward": 2.0},
         }
 
-        ray.get(
-            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
-        )
-        ray.get(
-            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
-        )
+        ray.get(buffer.add.remote(trajectory1, weight_version=0))
+        ray.get(buffer.add.remote(trajectory2, weight_version=1))
 
-        # Sample for current step 1 - should only get trajectory intended for step 1
+        # Window [max(0, 1-2), 1] = [0, 1] keeps both; FIFO returns the oldest.
         sample_result = ray.get(
             buffer.sample.remote(
                 num_prompt_groups=1,
@@ -301,31 +275,7 @@ class TestReplayBuffer:
 
         assert sample_result is not None
         assert len(sample_result["trajectories"]) == 1
-        assert sample_result["trajectories"][0]["batch"]["data"] == "for_step_1"
-
-        ray.kill(buffer)
-
-    def test_replay_buffer_get_existing_target_weights(self):
-        """Test getting existing target weight versions."""
-        buffer = ReplayBuffer.remote(max_size=10)
-
-        # Initially empty
-        existing_weights = ray.get(buffer.get_existing_target_weights.remote())
-        assert existing_weights == set()
-
-        # Push trajectories with different target weights
-        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
-        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
-
-        ray.get(
-            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
-        )
-        ray.get(
-            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=3)
-        )
-
-        existing_weights = ray.get(buffer.get_existing_target_weights.remote())
-        assert existing_weights == {1, 3}
+        assert sample_result["trajectories"][0]["batch"]["data"] == "first_in"
 
         ray.kill(buffer)
 
@@ -335,9 +285,7 @@ class TestReplayBuffer:
 
         # Push some trajectories
         trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
-        ray.get(
-            buffer.add.remote(trajectory, weight_version=0, target_weight_version=1)
-        )
+        ray.get(buffer.add.remote(trajectory, weight_version=0))
 
         # Verify buffer has content
         size = ray.get(buffer.size.remote())
@@ -353,7 +301,6 @@ class TestReplayBuffer:
         debug_info = ray.get(buffer.get_debug_info.remote())
         assert debug_info["total_trajectories"] == 0
         assert debug_info["trajectory_versions"] == []
-        assert debug_info["target_weight_versions"] == []
 
         ray.kill(buffer)
 
@@ -369,7 +316,6 @@ class TestReplayBufferNew:
             buf.add.remote(
                 self._make_traj(label),
                 weight_version=weight_version,
-                target_weight_version=0,  # unused in ReplayBufferNew
             )
         )
 
@@ -652,32 +598,6 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
-    def test_calculate_target_weights(self):
-        """Test target weight calculation logic."""
-        buffer = ReplayBuffer.remote(max_size=10)
-        mock_generation = MockGenerationInterface()
-        mock_tokenizer = mock.MagicMock()
-        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
-        task_to_env = {"test": mock_env}
-        master_config = self.create_mock_config()
-
-        collector = AsyncTrajectoryCollector.remote(
-            policy_generation=mock_generation,
-            tokenizer=mock_tokenizer,
-            task_to_env=task_to_env,
-            master_config=master_config,
-            replay_buffer=buffer,
-            start_step=0,
-        )
-
-        # Test target weight calculation with different scenarios
-        # Note: We can't directly test the private method, but we can test its effects
-        # through the public interface behavior
-
-        ray.kill(collector)
-        ray.kill(buffer)
-        ray.kill(mock_env)
-
     def test_dataloader_state_retrieval(self):
         """Test getting dataloader state for checkpointing."""
         buffer = ReplayBuffer.remote(max_size=10)
@@ -788,7 +708,6 @@ class TestAsyncUtilsIntegration:
                 buffer.add.remote(
                     trajectory,
                     weight_version=trajectory_id,
-                    target_weight_version=trajectory_id + 1,
                 )
             )
 

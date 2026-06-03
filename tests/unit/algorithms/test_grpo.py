@@ -177,7 +177,6 @@ class StubReplayBuffer:
             return_value={
                 "total_trajectories": self._size,
                 "trajectory_versions": [0],
-                "target_weight_versions": [0],
                 "max_size": 100,
             }
         )
